@@ -46,7 +46,7 @@ var (
 
 type IDTokenClaims struct {
 	Name     string   `json:"name,omitempty"`
-	Groups   []string `json:"groups,omitempty"`
+	Groups   []string `json:"x-hasura-org-codes,omitempty"`
 	Email    string   `json:"email"`
 	Username string   `json:"preferred_username,omitempty"`
 }
@@ -180,6 +180,7 @@ func (h *Headscale) OIDCCallback(
 	}
 
 	rawIDToken, err := h.getIDTokenForOIDCCallback(req.Context(), writer, code, state)
+	fmt.Printf("Raw token: %+v\n", rawIDToken)
 	if err != nil {
 		return
 	}

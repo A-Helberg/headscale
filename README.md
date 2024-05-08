@@ -1,3 +1,13 @@
+# Changes to Upstream
+This makes headscale work with kinde.com
+
+I modified the `allowed_groups` to read hasura organization codes instead of allowed_groups
+You can add a new org on kinde, add users to it, and add the orgs in the allowed_groups section of the headscale config
+
+
+Check [this PR](https://github.com/A-Helberg/headscale/pull/1) for a diff
+
+
 ![headscale logo](./docs/logo/headscale3_header_stacked_left.png)
 
 ![ci](https://github.com/juanfont/headscale/actions/workflows/test.yml/badge.svg)
