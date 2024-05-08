@@ -6,11 +6,16 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/juanfont/headscale/hscontrol/util"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
 func Test_NodeCanAccess(t *testing.T) {
+	iap := func(ipStr string) *netip.Addr {
+		ip := netip.MustParseAddr(ipStr)
+		return &ip
+	}
 	tests := []struct {
 		name  string
 		node1 Node
@@ -21,10 +26,10 @@ func Test_NodeCanAccess(t *testing.T) {
 		{
 			name: "no-rules",
 			node1: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
+				IPv4: iap("10.0.0.1"),
 			},
 			node2: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
+				IPv4: iap("10.0.0.2"),
 			},
 			rules: []tailcfg.FilterRule{},
 			want:  false,
@@ -32,10 +37,10 @@ func Test_NodeCanAccess(t *testing.T) {
 		{
 			name: "wildcard",
 			node1: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("10.0.0.1")},
+				IPv4: iap("10.0.0.1"),
 			},
 			node2: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("10.0.0.2")},
+				IPv4: iap("10.0.0.2"),
 			},
 			rules: []tailcfg.FilterRule{
 				{
@@ -53,10 +58,10 @@ func Test_NodeCanAccess(t *testing.T) {
 		{
 			name: "other-cant-access-src",
 			node1: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("100.64.0.1")},
+				IPv4: iap("100.64.0.1"),
 			},
 			node2: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("100.64.0.3")},
+				IPv4: iap("100.64.0.3"),
 			},
 			rules: []tailcfg.FilterRule{
 				{
@@ -71,10 +76,10 @@ func Test_NodeCanAccess(t *testing.T) {
 		{
 			name: "dest-cant-access-src",
 			node1: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("100.64.0.3")},
+				IPv4: iap("100.64.0.3"),
 			},
 			node2: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
+				IPv4: iap("100.64.0.2"),
 			},
 			rules: []tailcfg.FilterRule{
 				{
@@ -89,10 +94,10 @@ func Test_NodeCanAccess(t *testing.T) {
 		{
 			name: "src-can-access-dest",
 			node1: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("100.64.0.2")},
+				IPv4: iap("100.64.0.2"),
 			},
 			node2: Node{
-				IPAddresses: []netip.Addr{netip.MustParseAddr("100.64.0.3")},
+				IPv4: iap("100.64.0.3"),
 			},
 			rules: []tailcfg.FilterRule{
 				{
@@ -114,32 +119,6 @@ func Test_NodeCanAccess(t *testing.T) {
 				t.Errorf("canAccess() failed: want (%t), got (%t)", tt.want, got)
 			}
 		})
-	}
-}
-
-func TestNodeAddressesOrder(t *testing.T) {
-	machineAddresses := NodeAddresses{
-		netip.MustParseAddr("2001:db8::2"),
-		netip.MustParseAddr("100.64.0.2"),
-		netip.MustParseAddr("2001:db8::1"),
-		netip.MustParseAddr("100.64.0.1"),
-	}
-
-	strSlice := machineAddresses.StringSlice()
-	expected := []string{
-		"100.64.0.1",
-		"100.64.0.2",
-		"2001:db8::1",
-		"2001:db8::2",
-	}
-
-	if len(strSlice) != len(expected) {
-		t.Fatalf("unexpected slice length: got %v, want %v", len(strSlice), len(expected))
-	}
-	for i, addr := range strSlice {
-		if addr != expected[i] {
-			t.Errorf("unexpected address at index %v: got %v, want %v", i, addr, expected[i])
-		}
 	}
 }
 
@@ -361,6 +340,113 @@ func TestPeerChangeFromMapRequest(t *testing.T) {
 			got := tc.node.PeerChangeFromMapRequest(tc.mapReq)
 
 			if diff := cmp.Diff(tc.want, got, cmpopts.IgnoreFields(tailcfg.PeerChange{}, "LastSeen")); diff != "" {
+				t.Errorf("Patch unexpected result (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestApplyPeerChange(t *testing.T) {
+	tests := []struct {
+		name       string
+		nodeBefore Node
+		change     *tailcfg.PeerChange
+		want       Node
+	}{
+		{
+			name:       "hostinfo-and-netinfo-not-exists",
+			nodeBefore: Node{},
+			change: &tailcfg.PeerChange{
+				DERPRegion: 1,
+			},
+			want: Node{
+				Hostinfo: &tailcfg.Hostinfo{
+					NetInfo: &tailcfg.NetInfo{
+						PreferredDERP: 1,
+					},
+				},
+			},
+		},
+		{
+			name: "hostinfo-netinfo-not-exists",
+			nodeBefore: Node{
+				Hostinfo: &tailcfg.Hostinfo{
+					Hostname: "test",
+				},
+			},
+			change: &tailcfg.PeerChange{
+				DERPRegion: 3,
+			},
+			want: Node{
+				Hostinfo: &tailcfg.Hostinfo{
+					Hostname: "test",
+					NetInfo: &tailcfg.NetInfo{
+						PreferredDERP: 3,
+					},
+				},
+			},
+		},
+		{
+			name: "hostinfo-netinfo-exists-derp-set",
+			nodeBefore: Node{
+				Hostinfo: &tailcfg.Hostinfo{
+					Hostname: "test",
+					NetInfo: &tailcfg.NetInfo{
+						PreferredDERP: 999,
+					},
+				},
+			},
+			change: &tailcfg.PeerChange{
+				DERPRegion: 2,
+			},
+			want: Node{
+				Hostinfo: &tailcfg.Hostinfo{
+					Hostname: "test",
+					NetInfo: &tailcfg.NetInfo{
+						PreferredDERP: 2,
+					},
+				},
+			},
+		},
+		{
+			name:       "endpoints-not-set",
+			nodeBefore: Node{},
+			change: &tailcfg.PeerChange{
+				Endpoints: []netip.AddrPort{
+					netip.MustParseAddrPort("8.8.8.8:88"),
+				},
+			},
+			want: Node{
+				Endpoints: []netip.AddrPort{
+					netip.MustParseAddrPort("8.8.8.8:88"),
+				},
+			},
+		},
+		{
+			name: "endpoints-set",
+			nodeBefore: Node{
+				Endpoints: []netip.AddrPort{
+					netip.MustParseAddrPort("6.6.6.6:66"),
+				},
+			},
+			change: &tailcfg.PeerChange{
+				Endpoints: []netip.AddrPort{
+					netip.MustParseAddrPort("8.8.8.8:88"),
+				},
+			},
+			want: Node{
+				Endpoints: []netip.AddrPort{
+					netip.MustParseAddrPort("8.8.8.8:88"),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.nodeBefore.ApplyPeerChange(tt.change)
+
+			if diff := cmp.Diff(tt.want, tt.nodeBefore, util.Comparers...); diff != "" {
 				t.Errorf("Patch unexpected result (-want +got):\n%s", diff)
 			}
 		})

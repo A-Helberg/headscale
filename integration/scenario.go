@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"time"
 
 	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
 	"github.com/juanfont/headscale/hscontrol/util"
@@ -18,11 +19,14 @@ import (
 	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/samber/lo"
 	"golang.org/x/sync/errgroup"
+	"tailscale.com/envknob"
 )
 
 const (
 	scenarioHashLength = 6
 )
+
+var usePostgresForTest = envknob.Bool("HEADSCALE_INTEGRATION_POSTGRES")
 
 func enabledVersions(vs map[string]bool) []string {
 	var ret []string
@@ -47,6 +51,8 @@ var (
 	tailscaleVersions2021 = map[string]bool{
 		"head":     true,
 		"unstable": true,
+		"1.60":     true,  // CapVer: 82
+		"1.58":     true,  // CapVer: 82
 		"1.56":     true,  // CapVer: 82
 		"1.54":     true,  // CapVer: 79
 		"1.52":     true,  // CapVer: 79
@@ -56,8 +62,8 @@ var (
 		"1.44":     true,  // CapVer: 63
 		"1.42":     true,  // CapVer: 61
 		"1.40":     true,  // CapVer: 61
-		"1.38":     true,  // CapVer: 58
-		"1.36":     true,  // Oldest supported version, CapVer: 56
+		"1.38":     true,  // Oldest supported version, CapVer: 58
+		"1.36":     false, // CapVer: 56
 		"1.34":     false, // CapVer: 51
 		"1.32":     false, // CapVer: 46
 		"1.30":     false,
@@ -136,7 +142,7 @@ type Scenario struct {
 
 // NewScenario creates a test Scenario which can be used to bootstraps a ControlServer with
 // a set of Users and TailscaleClients.
-func NewScenario() (*Scenario, error) {
+func NewScenario(maxWait time.Duration) (*Scenario, error) {
 	hash, err := util.GenerateRandomStringDNSSafe(scenarioHashLength)
 	if err != nil {
 		return nil, err
@@ -147,7 +153,7 @@ func NewScenario() (*Scenario, error) {
 		return nil, fmt.Errorf("could not connect to docker: %w", err)
 	}
 
-	pool.MaxWait = dockertestMaxWait()
+	pool.MaxWait = maxWait
 
 	networkName := fmt.Sprintf("hs-%s", hash)
 	if overrideNetworkName := os.Getenv("HEADSCALE_TEST_NETWORK_NAME"); overrideNetworkName != "" {
@@ -452,6 +458,10 @@ func (s *Scenario) CreateHeadscaleEnv(
 	tsOpts []tsic.Option,
 	opts ...hsic.Option,
 ) error {
+	if usePostgresForTest {
+		opts = append(opts, hsic.WithPostgres())
+	}
+
 	headscale, err := s.Headscale(opts...)
 	if err != nil {
 		return err
@@ -501,7 +511,7 @@ func (s *Scenario) GetIPs(user string) ([]netip.Addr, error) {
 	return ips, fmt.Errorf("failed to get ips: %w", errNoUserAvailable)
 }
 
-// GetIPs returns all TailscaleClients associated with a User in a Scenario.
+// GetClients returns all TailscaleClients associated with a User in a Scenario.
 func (s *Scenario) GetClients(user string) ([]TailscaleClient, error) {
 	var clients []TailscaleClient
 	if ns, ok := s.users[user]; ok {
@@ -577,7 +587,7 @@ func (s *Scenario) ListTailscaleClientsIPs(users ...string) ([]netip.Addr, error
 	return allIps, nil
 }
 
-// ListTailscaleClientsIPs returns a list of FQDN based on Users
+// ListTailscaleClientsFQDNs returns a list of FQDN based on Users
 // passed as parameters.
 func (s *Scenario) ListTailscaleClientsFQDNs(users ...string) ([]string, error) {
 	allFQDNs := make([]string, 0)

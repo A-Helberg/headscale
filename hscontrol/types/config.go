@@ -31,6 +31,13 @@ var errOidcMutuallyExclusive = errors.New(
 	"oidc_client_secret and oidc_client_secret_path are mutually exclusive",
 )
 
+type IPAllocationStrategy string
+
+const (
+	IPAllocationStrategySequential IPAllocationStrategy = "sequential"
+	IPAllocationStrategyRandom     IPAllocationStrategy = "random"
+)
+
 // Config contains the initial Headscale configuration.
 type Config struct {
 	ServerURL                      string
@@ -39,23 +46,17 @@ type Config struct {
 	GRPCAddr                       string
 	GRPCAllowInsecure              bool
 	EphemeralNodeInactivityTimeout time.Duration
-	NodeUpdateCheckInterval        time.Duration
-	IPPrefixes                     []netip.Prefix
+	PrefixV4                       *netip.Prefix
+	PrefixV6                       *netip.Prefix
+	IPAllocation                   IPAllocationStrategy
 	NoisePrivateKeyPath            string
 	BaseDomain                     string
 	Log                            LogConfig
 	DisableUpdateCheck             bool
 
-	DERP DERPConfig
+	Database DatabaseConfig
 
-	DBtype string
-	DBpath string
-	DBhost string
-	DBport int
-	DBname string
-	DBuser string
-	DBpass string
-	DBssl  string
+	DERP DERPConfig
 
 	TLS TLSConfig
 
@@ -75,6 +76,33 @@ type Config struct {
 	CLI CLIConfig
 
 	ACL ACLConfig
+
+	Tuning Tuning
+}
+
+type SqliteConfig struct {
+	Path string
+}
+
+type PostgresConfig struct {
+	Host                string
+	Port                int
+	Name                string
+	User                string
+	Pass                string
+	Ssl                 string
+	MaxOpenConnections  int
+	MaxIdleConnections  int
+	ConnMaxIdleTimeSecs int
+}
+
+type DatabaseConfig struct {
+	// Type sets the database type, either "sqlite3" or "postgres"
+	Type  string
+	Debug bool
+
+	Sqlite   SqliteConfig
+	Postgres PostgresConfig
 }
 
 type TLSConfig struct {
@@ -142,6 +170,11 @@ type LogConfig struct {
 	Level  zerolog.Level
 }
 
+type Tuning struct {
+	BatchChangeDelay               time.Duration
+	NodeMapSessionBufferedChanSize int
+}
+
 func LoadConfig(path string, isFile bool) error {
 	if isFile {
 		viper.SetConfigFile(path)
@@ -183,7 +216,10 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("cli.timeout", "5s")
 	viper.SetDefault("cli.insecure", false)
 
-	viper.SetDefault("db_ssl", false)
+	viper.SetDefault("database.postgres.ssl", false)
+	viper.SetDefault("database.postgres.max_open_conns", 10)
+	viper.SetDefault("database.postgres.max_idle_conns", 10)
+	viper.SetDefault("database.postgres.conn_max_idle_time_secs", 3600)
 
 	viper.SetDefault("oidc.scope", []string{oidc.ScopeOpenID, "profile", "email"})
 	viper.SetDefault("oidc.strip_email_domain", true)
@@ -196,7 +232,10 @@ func LoadConfig(path string, isFile bool) error {
 
 	viper.SetDefault("ephemeral_node_inactivity_timeout", "120s")
 
-	viper.SetDefault("node_update_check_interval", "10s")
+	viper.SetDefault("tuning.batch_change_delay", "800ms")
+	viper.SetDefault("tuning.node_mapsession_buffered_chan_size", 30)
+
+	viper.SetDefault("prefixes.allocation", string(IPAllocationStrategySequential))
 
 	if IsCLIConfigured() {
 		return nil
@@ -248,17 +287,8 @@ func LoadConfig(path string, isFile bool) error {
 		)
 	}
 
-	maxNodeUpdateCheckInterval, _ := time.ParseDuration("60s")
-	if viper.GetDuration("node_update_check_interval") > maxNodeUpdateCheckInterval {
-		errorText += fmt.Sprintf(
-			"Fatal config error: node_update_check_interval (%s) is set too high, must be less than %s",
-			viper.GetString("node_update_check_interval"),
-			maxNodeUpdateCheckInterval,
-		)
-	}
-
 	if errorText != "" {
-		//nolint
+		// nolint
 		return errors.New(strings.TrimSuffix(errorText, "\n"))
 	} else {
 		return nil
@@ -389,6 +419,45 @@ func GetLogConfig() LogConfig {
 	}
 }
 
+func GetDatabaseConfig() DatabaseConfig {
+	debug := viper.GetBool("database.debug")
+
+	type_ := viper.GetString("database.type")
+
+	switch type_ {
+	case DatabaseSqlite, DatabasePostgres:
+		break
+	case "sqlite":
+		type_ = "sqlite3"
+	default:
+		log.Fatal().
+			Msgf("invalid database type %q, must be sqlite, sqlite3 or postgres", type_)
+	}
+
+	return DatabaseConfig{
+		Type:  type_,
+		Debug: debug,
+		Sqlite: SqliteConfig{
+			Path: util.AbsolutePathFromConfigPath(
+				viper.GetString("database.sqlite.path"),
+			),
+		},
+		Postgres: PostgresConfig{
+			Host:               viper.GetString("database.postgres.host"),
+			Port:               viper.GetInt("database.postgres.port"),
+			Name:               viper.GetString("database.postgres.name"),
+			User:               viper.GetString("database.postgres.user"),
+			Pass:               viper.GetString("database.postgres.pass"),
+			Ssl:                viper.GetString("database.postgres.ssl"),
+			MaxOpenConnections: viper.GetInt("database.postgres.max_open_conns"),
+			MaxIdleConnections: viper.GetInt("database.postgres.max_idle_conns"),
+			ConnMaxIdleTimeSecs: viper.GetInt(
+				"database.postgres.conn_max_idle_time_secs",
+			),
+		},
+	}
+}
+
 func GetDNSConfig() (*tailcfg.DNSConfig, string) {
 	if viper.IsSet("dns_config") {
 		dnsConfig := &tailcfg.DNSConfig{}
@@ -508,6 +577,57 @@ func GetDNSConfig() (*tailcfg.DNSConfig, string) {
 	return nil, ""
 }
 
+func PrefixV4() (*netip.Prefix, error) {
+	prefixV4Str := viper.GetString("prefixes.v4")
+
+	if prefixV4Str == "" {
+		return nil, nil
+	}
+
+	prefixV4, err := netip.ParsePrefix(prefixV4Str)
+	if err != nil {
+		return nil, fmt.Errorf("parsing IPv4 prefix from config: %w", err)
+	}
+
+	builder := netipx.IPSetBuilder{}
+	builder.AddPrefix(tsaddr.CGNATRange())
+	builder.AddPrefix(tsaddr.TailscaleULARange())
+	ipSet, _ := builder.IPSet()
+	if !ipSet.ContainsPrefix(prefixV4) {
+		log.Warn().
+			Msgf("Prefix %s is not in the %s range. This is an unsupported configuration.",
+				prefixV4Str, tsaddr.CGNATRange())
+	}
+
+	return &prefixV4, nil
+}
+
+func PrefixV6() (*netip.Prefix, error) {
+	prefixV6Str := viper.GetString("prefixes.v6")
+
+	if prefixV6Str == "" {
+		return nil, nil
+	}
+
+	prefixV6, err := netip.ParsePrefix(prefixV6Str)
+	if err != nil {
+		return nil, fmt.Errorf("parsing IPv6 prefix from config: %w", err)
+	}
+
+	builder := netipx.IPSetBuilder{}
+	builder.AddPrefix(tsaddr.CGNATRange())
+	builder.AddPrefix(tsaddr.TailscaleULARange())
+	ipSet, _ := builder.IPSet()
+
+	if !ipSet.ContainsPrefix(prefixV6) {
+		log.Warn().
+			Msgf("Prefix %s is not in the %s range. This is an unsupported configuration.",
+				prefixV6Str, tsaddr.TailscaleULARange())
+	}
+
+	return &prefixV6, nil
+}
+
 func GetHeadscaleConfig() (*Config, error) {
 	if IsCLIConfigured() {
 		return &Config{
@@ -520,65 +640,35 @@ func GetHeadscaleConfig() (*Config, error) {
 		}, nil
 	}
 
+	prefix4, err := PrefixV4()
+	if err != nil {
+		return nil, err
+	}
+
+	prefix6, err := PrefixV6()
+	if err != nil {
+		return nil, err
+	}
+
+	if prefix4 == nil && prefix6 == nil {
+		return nil, fmt.Errorf("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
+	}
+
+	allocStr := viper.GetString("prefixes.allocation")
+	var alloc IPAllocationStrategy
+	switch allocStr {
+	case string(IPAllocationStrategySequential):
+		alloc = IPAllocationStrategySequential
+	case string(IPAllocationStrategyRandom):
+		alloc = IPAllocationStrategyRandom
+	default:
+		return nil, fmt.Errorf("config error, prefixes.allocation is set to %s, which is not a valid strategy, allowed options: %s, %s", allocStr, IPAllocationStrategySequential, IPAllocationStrategyRandom)
+	}
+
 	dnsConfig, baseDomain := GetDNSConfig()
 	derpConfig := GetDERPConfig()
 	logConfig := GetLogTailConfig()
 	randomizeClientPort := viper.GetBool("randomize_client_port")
-
-	configuredPrefixes := viper.GetStringSlice("ip_prefixes")
-	parsedPrefixes := make([]netip.Prefix, 0, len(configuredPrefixes)+1)
-
-	for i, prefixInConfig := range configuredPrefixes {
-		prefix, err := netip.ParsePrefix(prefixInConfig)
-		if err != nil {
-			panic(fmt.Errorf("failed to parse ip_prefixes[%d]: %w", i, err))
-		}
-
-		if prefix.Addr().Is4() {
-			builder := netipx.IPSetBuilder{}
-			builder.AddPrefix(tsaddr.CGNATRange())
-			ipSet, _ := builder.IPSet()
-			if !ipSet.ContainsPrefix(prefix) {
-				log.Warn().
-					Msgf("Prefix %s is not in the %s range. This is an unsupported configuration.",
-						prefixInConfig, tsaddr.CGNATRange())
-			}
-		}
-
-		if prefix.Addr().Is6() {
-			builder := netipx.IPSetBuilder{}
-			builder.AddPrefix(tsaddr.TailscaleULARange())
-			ipSet, _ := builder.IPSet()
-			if !ipSet.ContainsPrefix(prefix) {
-				log.Warn().
-					Msgf("Prefix %s is not in the %s range. This is an unsupported configuration.",
-						prefixInConfig, tsaddr.TailscaleULARange())
-			}
-		}
-
-		parsedPrefixes = append(parsedPrefixes, prefix)
-	}
-
-	prefixes := make([]netip.Prefix, 0, len(parsedPrefixes))
-	{
-		// dedup
-		normalizedPrefixes := make(map[string]int, len(parsedPrefixes))
-		for i, p := range parsedPrefixes {
-			normalized, _ := netipx.RangeOfPrefix(p).Prefix()
-			normalizedPrefixes[normalized.String()] = i
-		}
-
-		// convert back to list
-		for _, i := range normalizedPrefixes {
-			prefixes = append(prefixes, parsedPrefixes[i])
-		}
-	}
-
-	if len(prefixes) < 1 {
-		prefixes = append(prefixes, netip.MustParsePrefix("100.64.0.0/10"))
-		log.Warn().
-			Msgf("'ip_prefixes' not configured, falling back to default: %v", prefixes)
-	}
 
 	oidcClientSecret := viper.GetString("oidc.client_secret")
 	oidcClientSecretPath := viper.GetString("oidc.client_secret_path")
@@ -590,7 +680,7 @@ func GetHeadscaleConfig() (*Config, error) {
 		if err != nil {
 			return nil, err
 		}
-		oidcClientSecret = string(secretBytes)
+		oidcClientSecret = strings.TrimSpace(string(secretBytes))
 	}
 
 	return &Config{
@@ -601,7 +691,10 @@ func GetHeadscaleConfig() (*Config, error) {
 		GRPCAllowInsecure:  viper.GetBool("grpc_allow_insecure"),
 		DisableUpdateCheck: viper.GetBool("disable_check_updates"),
 
-		IPPrefixes: prefixes,
+		PrefixV4:     prefix4,
+		PrefixV6:     prefix6,
+		IPAllocation: IPAllocationStrategy(alloc),
+
 		NoisePrivateKeyPath: util.AbsolutePathFromConfigPath(
 			viper.GetString("noise.private_key_path"),
 		),
@@ -613,18 +706,7 @@ func GetHeadscaleConfig() (*Config, error) {
 			"ephemeral_node_inactivity_timeout",
 		),
 
-		NodeUpdateCheckInterval: viper.GetDuration(
-			"node_update_check_interval",
-		),
-
-		DBtype: viper.GetString("db_type"),
-		DBpath: util.AbsolutePathFromConfigPath(viper.GetString("db_path")),
-		DBhost: viper.GetString("db_host"),
-		DBport: viper.GetInt("db_port"),
-		DBname: viper.GetString("db_name"),
-		DBuser: viper.GetString("db_user"),
-		DBpass: viper.GetString("db_pass"),
-		DBssl:  viper.GetString("db_ssl"),
+		Database: GetDatabaseConfig(),
 
 		TLS: GetTLSConfig(),
 
@@ -680,6 +762,12 @@ func GetHeadscaleConfig() (*Config, error) {
 		},
 
 		Log: GetLogConfig(),
+
+		// TODO(kradalby): Document these settings when more stable
+		Tuning: Tuning{
+			BatchChangeDelay:               viper.GetDuration("tuning.batch_change_delay"),
+			NodeMapSessionBufferedChanSize: viper.GetInt("tuning.node_mapsession_buffered_chan_size"),
+		},
 	}, nil
 }
 

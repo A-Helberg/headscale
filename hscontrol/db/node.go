@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
 	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/patrickmn/go-cache"
+	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/rs/zerolog/log"
 	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
@@ -34,28 +34,22 @@ var (
 	)
 )
 
-// ListPeers returns all peers of node, regardless of any Policy or if the node is expired.
-func (hsdb *HSDatabase) ListPeers(node *types.Node) (types.Nodes, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.listPeers(node)
+func (hsdb *HSDatabase) ListPeers(nodeID types.NodeID) (types.Nodes, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (types.Nodes, error) {
+		return ListPeers(rx, nodeID)
+	})
 }
 
-func (hsdb *HSDatabase) listPeers(node *types.Node) (types.Nodes, error) {
-	log.Trace().
-		Caller().
-		Str("node", node.Hostname).
-		Msg("Finding direct peers")
-
+// ListPeers returns all peers of node, regardless of any Policy or if the node is expired.
+func ListPeers(tx *gorm.DB, nodeID types.NodeID) (types.Nodes, error) {
 	nodes := types.Nodes{}
-	if err := hsdb.db.
+	if err := tx.
 		Preload("AuthKey").
 		Preload("AuthKey.User").
 		Preload("User").
 		Preload("Routes").
-		Where("node_key <> ?",
-			node.NodeKey.String()).Find(&nodes).Error; err != nil {
+		Where("id <> ?",
+			nodeID).Find(&nodes).Error; err != nil {
 		return types.Nodes{}, err
 	}
 
@@ -64,16 +58,15 @@ func (hsdb *HSDatabase) listPeers(node *types.Node) (types.Nodes, error) {
 	return nodes, nil
 }
 
-func (hsdb *HSDatabase) ListNodes() ([]types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.listNodes()
+func (hsdb *HSDatabase) ListNodes() (types.Nodes, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (types.Nodes, error) {
+		return ListNodes(rx)
+	})
 }
 
-func (hsdb *HSDatabase) listNodes() ([]types.Node, error) {
-	nodes := []types.Node{}
-	if err := hsdb.db.
+func ListNodes(tx *gorm.DB) (types.Nodes, error) {
+	nodes := types.Nodes{}
+	if err := tx.
 		Preload("AuthKey").
 		Preload("AuthKey.User").
 		Preload("User").
@@ -85,16 +78,9 @@ func (hsdb *HSDatabase) listNodes() ([]types.Node, error) {
 	return nodes, nil
 }
 
-func (hsdb *HSDatabase) ListNodesByGivenName(givenName string) (types.Nodes, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.listNodesByGivenName(givenName)
-}
-
-func (hsdb *HSDatabase) listNodesByGivenName(givenName string) (types.Nodes, error) {
+func listNodesByGivenName(tx *gorm.DB, givenName string) (types.Nodes, error) {
 	nodes := types.Nodes{}
-	if err := hsdb.db.
+	if err := tx.
 		Preload("AuthKey").
 		Preload("AuthKey.User").
 		Preload("User").
@@ -106,12 +92,15 @@ func (hsdb *HSDatabase) listNodesByGivenName(givenName string) (types.Nodes, err
 	return nodes, nil
 }
 
-// GetNode finds a Node by name and user and returns the Node struct.
-func (hsdb *HSDatabase) GetNode(user string, name string) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
+func (hsdb *HSDatabase) getNode(user string, name string) (*types.Node, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (*types.Node, error) {
+		return getNode(rx, user, name)
+	})
+}
 
-	nodes, err := hsdb.ListNodesByUser(user)
+// getNode finds a Node by name and user and returns the Node struct.
+func getNode(tx *gorm.DB, user string, name string) (*types.Node, error) {
+	nodes, err := ListNodesByUser(tx, user)
 	if err != nil {
 		return nil, err
 	}
@@ -125,34 +114,16 @@ func (hsdb *HSDatabase) GetNode(user string, name string) (*types.Node, error) {
 	return nil, ErrNodeNotFound
 }
 
-// GetNodeByGivenName finds a Node by given name and user and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByGivenName(
-	user string,
-	givenName string,
-) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	node := types.Node{}
-	if err := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		Where("given_name = ?", givenName).First(&node).Error; err != nil {
-		return nil, err
-	}
-
-	return nil, ErrNodeNotFound
+func (hsdb *HSDatabase) GetNodeByID(id types.NodeID) (*types.Node, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (*types.Node, error) {
+		return GetNodeByID(rx, id)
+	})
 }
 
 // GetNodeByID finds a Node by ID and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByID(id uint64) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
+func GetNodeByID(tx *gorm.DB, id types.NodeID) (*types.Node, error) {
 	mach := types.Node{}
-	if result := hsdb.db.
+	if result := tx.
 		Preload("AuthKey").
 		Preload("AuthKey.User").
 		Preload("User").
@@ -164,21 +135,19 @@ func (hsdb *HSDatabase) GetNodeByID(id uint64) (*types.Node, error) {
 	return &mach, nil
 }
 
-// GetNodeByMachineKey finds a Node by its MachineKey and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByMachineKey(
-	machineKey key.MachinePublic,
-) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.getNodeByMachineKey(machineKey)
+func (hsdb *HSDatabase) GetNodeByMachineKey(machineKey key.MachinePublic) (*types.Node, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) (*types.Node, error) {
+		return GetNodeByMachineKey(rx, machineKey)
+	})
 }
 
-func (hsdb *HSDatabase) getNodeByMachineKey(
+// GetNodeByMachineKey finds a Node by its MachineKey and returns the Node struct.
+func GetNodeByMachineKey(
+	tx *gorm.DB,
 	machineKey key.MachinePublic,
 ) (*types.Node, error) {
 	mach := types.Node{}
-	if result := hsdb.db.
+	if result := tx.
 		Preload("AuthKey").
 		Preload("AuthKey.User").
 		Preload("User").
@@ -190,36 +159,24 @@ func (hsdb *HSDatabase) getNodeByMachineKey(
 	return &mach, nil
 }
 
-// GetNodeByNodeKey finds a Node by its current NodeKey.
-func (hsdb *HSDatabase) GetNodeByNodeKey(
+func (hsdb *HSDatabase) GetNodeByAnyKey(
+	machineKey key.MachinePublic,
 	nodeKey key.NodePublic,
+	oldNodeKey key.NodePublic,
 ) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	node := types.Node{}
-	if result := hsdb.db.
-		Preload("AuthKey").
-		Preload("AuthKey.User").
-		Preload("User").
-		Preload("Routes").
-		First(&node, "node_key = ?",
-			nodeKey.String()); result.Error != nil {
-		return nil, result.Error
-	}
-
-	return &node, nil
+	return Read(hsdb.DB, func(rx *gorm.DB) (*types.Node, error) {
+		return GetNodeByAnyKey(rx, machineKey, nodeKey, oldNodeKey)
+	})
 }
 
 // GetNodeByAnyKey finds a Node by its MachineKey, its current NodeKey or the old one, and returns the Node struct.
-func (hsdb *HSDatabase) GetNodeByAnyKey(
+// TODO(kradalby): see if we can remove this.
+func GetNodeByAnyKey(
+	tx *gorm.DB,
 	machineKey key.MachinePublic, nodeKey key.NodePublic, oldNodeKey key.NodePublic,
 ) (*types.Node, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
 	node := types.Node{}
-	if result := hsdb.db.
+	if result := tx.
 		Preload("AuthKey").
 		Preload("AuthKey.User").
 		Preload("User").
@@ -234,49 +191,39 @@ func (hsdb *HSDatabase) GetNodeByAnyKey(
 	return &node, nil
 }
 
-func (hsdb *HSDatabase) NodeReloadFromDatabase(node *types.Node) error {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	if result := hsdb.db.Find(node).First(&node); result.Error != nil {
-		return result.Error
-	}
-
-	return nil
+func (hsdb *HSDatabase) SetTags(
+	nodeID types.NodeID,
+	tags []string,
+) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return SetTags(tx, nodeID, tags)
+	})
 }
 
 // SetTags takes a Node struct pointer and update the forced tags.
-func (hsdb *HSDatabase) SetTags(
-	node *types.Node,
+func SetTags(
+	tx *gorm.DB,
+	nodeID types.NodeID,
 	tags []string,
 ) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
 	if len(tags) == 0 {
+		// if no tags are provided, we remove all forced tags
+		if err := tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("forced_tags", types.StringList{}).Error; err != nil {
+			return fmt.Errorf("failed to remove tags for node in the database: %w", err)
+		}
+
 		return nil
 	}
 
-	newTags := []string{}
+	newTags := types.StringList{}
 	for _, tag := range tags {
 		if !util.StringOrPrefixListContains(newTags, tag) {
 			newTags = append(newTags, tag)
 		}
 	}
 
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		ForcedTags: newTags,
-	}).Error; err != nil {
+	if err := tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("forced_tags", newTags).Error; err != nil {
 		return fmt.Errorf("failed to update tags for node in the database: %w", err)
-	}
-
-	stateUpdate := types.StateUpdate{
-		Type:        types.StatePeerChanged,
-		ChangeNodes: types.Nodes{node},
-		Message:     "called from db.SetTags",
-	}
-	if stateUpdate.Valid() {
-		hsdb.notifier.NotifyWithIgnore(stateUpdate, node.MachineKey.String())
 	}
 
 	return nil
@@ -284,140 +231,77 @@ func (hsdb *HSDatabase) SetTags(
 
 // RenameNode takes a Node struct and a new GivenName for the nodes
 // and renames it.
-func (hsdb *HSDatabase) RenameNode(node *types.Node, newName string) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
+func RenameNode(tx *gorm.DB,
+	nodeID uint64, newName string,
+) error {
 	err := util.CheckForFQDNRules(
 		newName,
 	)
 	if err != nil {
-		log.Error().
-			Caller().
-			Str("func", "RenameNode").
-			Str("node", node.Hostname).
-			Str("newName", newName).
-			Err(err).
-			Msg("failed to rename node")
-
-		return err
+		return fmt.Errorf("renaming node: %w", err)
 	}
-	node.GivenName = newName
 
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		GivenName: newName,
-	}).Error; err != nil {
+	if err := tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("given_name", newName).Error; err != nil {
 		return fmt.Errorf("failed to rename node in the database: %w", err)
 	}
 
-	stateUpdate := types.StateUpdate{
-		Type:        types.StatePeerChanged,
-		ChangeNodes: types.Nodes{node},
-		Message:     "called from db.RenameNode",
-	}
-	if stateUpdate.Valid() {
-		hsdb.notifier.NotifyWithIgnore(stateUpdate, node.MachineKey.String())
-	}
-
 	return nil
+}
+
+func (hsdb *HSDatabase) NodeSetExpiry(nodeID types.NodeID, expiry time.Time) error {
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return NodeSetExpiry(tx, nodeID, expiry)
+	})
 }
 
 // NodeSetExpiry takes a Node struct and  a new expiry time.
-func (hsdb *HSDatabase) NodeSetExpiry(node *types.Node, expiry time.Time) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	return hsdb.nodeSetExpiry(node, expiry)
+func NodeSetExpiry(tx *gorm.DB,
+	nodeID types.NodeID, expiry time.Time,
+) error {
+	return tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("expiry", expiry).Error
 }
 
-func (hsdb *HSDatabase) nodeSetExpiry(node *types.Node, expiry time.Time) error {
-	if err := hsdb.db.Model(node).Updates(types.Node{
-		Expiry: &expiry,
-	}).Error; err != nil {
-		return fmt.Errorf(
-			"failed to refresh node (update expiration) in the database: %w",
-			err,
-		)
-	}
-
-	node.Expiry = &expiry
-
-	stateSelfUpdate := types.StateUpdate{
-		Type:        types.StateSelfUpdate,
-		ChangeNodes: types.Nodes{node},
-	}
-	if stateSelfUpdate.Valid() {
-		hsdb.notifier.NotifyByMachineKey(stateSelfUpdate, node.MachineKey)
-	}
-
-	stateUpdate := types.StateUpdate{
-		Type: types.StatePeerChangedPatch,
-		ChangePatches: []*tailcfg.PeerChange{
-			{
-				NodeID:    tailcfg.NodeID(node.ID),
-				KeyExpiry: &expiry,
-			},
-		},
-	}
-	if stateUpdate.Valid() {
-		hsdb.notifier.NotifyWithIgnore(stateUpdate, node.MachineKey.String())
-	}
-
-	return nil
+func (hsdb *HSDatabase) DeleteNode(node *types.Node, isLikelyConnected *xsync.MapOf[types.NodeID, bool]) ([]types.NodeID, error) {
+	return Write(hsdb.DB, func(tx *gorm.DB) ([]types.NodeID, error) {
+		return DeleteNode(tx, node, isLikelyConnected)
+	})
 }
 
 // DeleteNode deletes a Node from the database.
-func (hsdb *HSDatabase) DeleteNode(node *types.Node) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	return hsdb.deleteNode(node)
-}
-
-func (hsdb *HSDatabase) deleteNode(node *types.Node) error {
-	err := hsdb.deleteNodeRoutes(node)
+// Caller is responsible for notifying all of change.
+func DeleteNode(tx *gorm.DB,
+	node *types.Node,
+	isLikelyConnected *xsync.MapOf[types.NodeID, bool],
+) ([]types.NodeID, error) {
+	changed, err := deleteNodeRoutes(tx, node, isLikelyConnected)
 	if err != nil {
-		return err
+		return changed, err
 	}
 
 	// Unscoped causes the node to be fully removed from the database.
-	if err := hsdb.db.Unscoped().Delete(&node).Error; err != nil {
-		return err
+	if err := tx.Unscoped().Delete(&node).Error; err != nil {
+		return changed, err
 	}
 
-	stateUpdate := types.StateUpdate{
-		Type:    types.StatePeerRemoved,
-		Removed: []tailcfg.NodeID{tailcfg.NodeID(node.ID)},
-	}
-	if stateUpdate.Valid() {
-		hsdb.notifier.NotifyAll(stateUpdate)
-	}
-
-	return nil
+	return changed, nil
 }
 
-// UpdateLastSeen sets a node's last seen field indicating that we
+// SetLastSeen sets a node's last seen field indicating that we
 // have recently communicating with this node.
-// This is mostly used to indicate if a node is online and is not
-// extremely important to make sure is fully correct and to avoid
-// holding up the hot path, does not contain any locks and isnt
-// concurrency safe. But that should be ok.
-func (hsdb *HSDatabase) UpdateLastSeen(node *types.Node) error {
-	return hsdb.db.Model(node).Updates(types.Node{
-		LastSeen: node.LastSeen,
-	}).Error
+func SetLastSeen(tx *gorm.DB, nodeID types.NodeID, lastSeen time.Time) error {
+	return tx.Model(&types.Node{}).Where("id = ?", nodeID).Update("last_seen", lastSeen).Error
 }
 
-func (hsdb *HSDatabase) RegisterNodeFromAuthCallback(
+func RegisterNodeFromAuthCallback(
+	tx *gorm.DB,
 	cache *cache.Cache,
 	mkey key.MachinePublic,
 	userName string,
 	nodeExpiry *time.Time,
 	registrationMethod string,
+	ipv4 *netip.Addr,
+	ipv6 *netip.Addr,
 ) (*types.Node, error) {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
 	log.Debug().
 		Str("machine_key", mkey.ShortString()).
 		Str("userName", userName).
@@ -427,7 +311,7 @@ func (hsdb *HSDatabase) RegisterNodeFromAuthCallback(
 
 	if nodeInterface, ok := cache.Get(mkey.String()); ok {
 		if registrationNode, ok := nodeInterface.(types.Node); ok {
-			user, err := hsdb.getUser(userName)
+			user, err := GetUser(tx, userName)
 			if err != nil {
 				return nil, fmt.Errorf(
 					"failed to find user in register node from auth callback, %w",
@@ -442,14 +326,17 @@ func (hsdb *HSDatabase) RegisterNodeFromAuthCallback(
 			}
 
 			registrationNode.UserID = user.ID
+			registrationNode.User = *user
 			registrationNode.RegisterMethod = registrationMethod
 
 			if nodeExpiry != nil {
 				registrationNode.Expiry = nodeExpiry
 			}
 
-			node, err := hsdb.registerNode(
+			node, err := RegisterNode(
+				tx,
 				registrationNode,
+				ipv4, ipv6,
 			)
 
 			if err == nil {
@@ -465,15 +352,14 @@ func (hsdb *HSDatabase) RegisterNodeFromAuthCallback(
 	return nil, ErrNodeNotFoundRegistrationCache
 }
 
-// RegisterNode is executed from the CLI to register a new Node using its MachineKey.
-func (hsdb *HSDatabase) RegisterNode(node types.Node) (*types.Node, error) {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	return hsdb.registerNode(node)
+func (hsdb *HSDatabase) RegisterNode(node types.Node, ipv4 *netip.Addr, ipv6 *netip.Addr) (*types.Node, error) {
+	return Write(hsdb.DB, func(tx *gorm.DB) (*types.Node, error) {
+		return RegisterNode(tx, node, ipv4, ipv6)
+	})
 }
 
-func (hsdb *HSDatabase) registerNode(node types.Node) (*types.Node, error) {
+// RegisterNode is executed from the CLI to register a new Node using its MachineKey.
+func RegisterNode(tx *gorm.DB, node types.Node, ipv4 *netip.Addr, ipv6 *netip.Addr) (*types.Node, error) {
 	log.Debug().
 		Str("node", node.Hostname).
 		Str("machine_key", node.MachineKey.ShortString()).
@@ -481,11 +367,11 @@ func (hsdb *HSDatabase) registerNode(node types.Node) (*types.Node, error) {
 		Str("user", node.User.Name).
 		Msg("Registering node")
 
-	// If the node exists and we had already IPs for it, we just save it
+	// If the node exists and it already has IP(s), we just save it
 	// so we store the node.Expire and node.Nodekey that has been set when
 	// adding it to the registrationCache
-	if len(node.IPAddresses) > 0 {
-		if err := hsdb.db.Save(&node).Error; err != nil {
+	if node.IPv4 != nil || node.IPv6 != nil {
+		if err := tx.Save(&node).Error; err != nil {
 			return nil, fmt.Errorf("failed register existing node in the database: %w", err)
 		}
 
@@ -500,101 +386,70 @@ func (hsdb *HSDatabase) registerNode(node types.Node) (*types.Node, error) {
 		return &node, nil
 	}
 
-	hsdb.ipAllocationMutex.Lock()
-	defer hsdb.ipAllocationMutex.Unlock()
+	node.IPv4 = ipv4
+	node.IPv6 = ipv6
 
-	ips, err := hsdb.getAvailableIPs()
-	if err != nil {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("node", node.Hostname).
-			Msg("Could not find IP for the new node")
-
-		return nil, err
-	}
-
-	node.IPAddresses = ips
-
-	if err := hsdb.db.Save(&node).Error; err != nil {
+	if err := tx.Save(&node).Error; err != nil {
 		return nil, fmt.Errorf("failed register(save) node in the database: %w", err)
 	}
 
 	log.Trace().
 		Caller().
 		Str("node", node.Hostname).
-		Str("ip", strings.Join(ips.StringSlice(), ",")).
 		Msg("Node registered with the database")
 
 	return &node, nil
 }
 
 // NodeSetNodeKey sets the node key of a node and saves it to the database.
-func (hsdb *HSDatabase) NodeSetNodeKey(node *types.Node, nodeKey key.NodePublic) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	if err := hsdb.db.Model(node).Updates(types.Node{
+func NodeSetNodeKey(tx *gorm.DB, node *types.Node, nodeKey key.NodePublic) error {
+	return tx.Model(node).Updates(types.Node{
 		NodeKey: nodeKey,
-	}).Error; err != nil {
-		return err
-	}
-
-	return nil
+	}).Error
 }
 
-// NodeSetMachineKey sets the node key of a node and saves it to the database.
 func (hsdb *HSDatabase) NodeSetMachineKey(
 	node *types.Node,
 	machineKey key.MachinePublic,
 ) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+	return hsdb.Write(func(tx *gorm.DB) error {
+		return NodeSetMachineKey(tx, node, machineKey)
+	})
+}
 
-	if err := hsdb.db.Model(node).Updates(types.Node{
+// NodeSetMachineKey sets the node key of a node and saves it to the database.
+func NodeSetMachineKey(
+	tx *gorm.DB,
+	node *types.Node,
+	machineKey key.MachinePublic,
+) error {
+	return tx.Model(node).Updates(types.Node{
 		MachineKey: machineKey,
-	}).Error; err != nil {
-		return err
-	}
-
-	return nil
+	}).Error
 }
 
 // NodeSave saves a node object to the database, prefer to use a specific save method rather
 // than this. It is intended to be used when we are changing or.
-func (hsdb *HSDatabase) NodeSave(node *types.Node) error {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
+// TODO(kradalby): Remove this func, just use Save.
+func NodeSave(tx *gorm.DB, node *types.Node) error {
+	return tx.Save(node).Error
+}
 
-	if err := hsdb.db.Save(node).Error; err != nil {
-		return err
-	}
-
-	return nil
+func (hsdb *HSDatabase) GetAdvertisedRoutes(node *types.Node) ([]netip.Prefix, error) {
+	return Read(hsdb.DB, func(rx *gorm.DB) ([]netip.Prefix, error) {
+		return GetAdvertisedRoutes(rx, node)
+	})
 }
 
 // GetAdvertisedRoutes returns the routes that are be advertised by the given node.
-func (hsdb *HSDatabase) GetAdvertisedRoutes(node *types.Node) ([]netip.Prefix, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.getAdvertisedRoutes(node)
-}
-
-func (hsdb *HSDatabase) getAdvertisedRoutes(node *types.Node) ([]netip.Prefix, error) {
+func GetAdvertisedRoutes(tx *gorm.DB, node *types.Node) ([]netip.Prefix, error) {
 	routes := types.Routes{}
 
-	err := hsdb.db.
+	err := tx.
 		Preload("Node").
 		Where("node_id = ? AND advertised = ?", node.ID, true).Find(&routes).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("node", node.Hostname).
-			Msg("Could not get advertised routes for node")
-
-		return nil, err
+		return nil, fmt.Errorf("getting advertised routes for node(%d): %w", node.ID, err)
 	}
 
 	prefixes := []netip.Prefix{}
@@ -605,29 +460,22 @@ func (hsdb *HSDatabase) getAdvertisedRoutes(node *types.Node) ([]netip.Prefix, e
 	return prefixes, nil
 }
 
-// GetEnabledRoutes returns the routes that are enabled for the node.
 func (hsdb *HSDatabase) GetEnabledRoutes(node *types.Node) ([]netip.Prefix, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
-	return hsdb.getEnabledRoutes(node)
+	return Read(hsdb.DB, func(rx *gorm.DB) ([]netip.Prefix, error) {
+		return GetEnabledRoutes(rx, node)
+	})
 }
 
-func (hsdb *HSDatabase) getEnabledRoutes(node *types.Node) ([]netip.Prefix, error) {
+// GetEnabledRoutes returns the routes that are enabled for the node.
+func GetEnabledRoutes(tx *gorm.DB, node *types.Node) ([]netip.Prefix, error) {
 	routes := types.Routes{}
 
-	err := hsdb.db.
+	err := tx.
 		Preload("Node").
 		Where("node_id = ? AND advertised = ? AND enabled = ?", node.ID, true, true).
 		Find(&routes).Error
 	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		log.Error().
-			Caller().
-			Err(err).
-			Str("node", node.Hostname).
-			Msg("Could not get enabled routes for node")
-
-		return nil, err
+		return nil, fmt.Errorf("getting enabled routes for node(%d): %w", node.ID, err)
 	}
 
 	prefixes := []netip.Prefix{}
@@ -638,19 +486,14 @@ func (hsdb *HSDatabase) getEnabledRoutes(node *types.Node) ([]netip.Prefix, erro
 	return prefixes, nil
 }
 
-func (hsdb *HSDatabase) IsRoutesEnabled(node *types.Node, routeStr string) bool {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
-
+func IsRoutesEnabled(tx *gorm.DB, node *types.Node, routeStr string) bool {
 	route, err := netip.ParsePrefix(routeStr)
 	if err != nil {
 		return false
 	}
 
-	enabledRoutes, err := hsdb.getEnabledRoutes(node)
+	enabledRoutes, err := GetEnabledRoutes(tx, node)
 	if err != nil {
-		log.Error().Err(err).Msg("Could not get enabled routes")
-
 		return false
 	}
 
@@ -663,26 +506,37 @@ func (hsdb *HSDatabase) IsRoutesEnabled(node *types.Node, routeStr string) bool 
 	return false
 }
 
+func (hsdb *HSDatabase) enableRoutes(
+	node *types.Node,
+	routeStrs ...string,
+) (*types.StateUpdate, error) {
+	return Write(hsdb.DB, func(tx *gorm.DB) (*types.StateUpdate, error) {
+		return enableRoutes(tx, node, routeStrs...)
+	})
+}
+
 // enableRoutes enables new routes based on a list of new routes.
-func (hsdb *HSDatabase) enableRoutes(node *types.Node, routeStrs ...string) error {
+func enableRoutes(tx *gorm.DB,
+	node *types.Node, routeStrs ...string,
+) (*types.StateUpdate, error) {
 	newRoutes := make([]netip.Prefix, len(routeStrs))
 	for index, routeStr := range routeStrs {
 		route, err := netip.ParsePrefix(routeStr)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		newRoutes[index] = route
 	}
 
-	advertisedRoutes, err := hsdb.getAdvertisedRoutes(node)
+	advertisedRoutes, err := GetAdvertisedRoutes(tx, node)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, newRoute := range newRoutes {
 		if !util.StringOrPrefixListContains(advertisedRoutes, newRoute) {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"route (%s) is not available on node %s: %w",
 				node.Hostname,
 				newRoute, ErrNodeRouteIsNotAvailable,
@@ -693,7 +547,7 @@ func (hsdb *HSDatabase) enableRoutes(node *types.Node, routeStrs ...string) erro
 	// Separate loop so we don't leave things in a half-updated state
 	for _, prefix := range newRoutes {
 		route := types.Route{}
-		err := hsdb.db.Preload("Node").
+		err := tx.Preload("Node").
 			Where("node_id = ? AND prefix = ?", node.ID, types.IPPrefix(prefix)).
 			First(&route).Error
 		if err == nil {
@@ -702,23 +556,23 @@ func (hsdb *HSDatabase) enableRoutes(node *types.Node, routeStrs ...string) erro
 			// Mark already as primary if there is only this node offering this subnet
 			// (and is not an exit route)
 			if !route.IsExitRoute() {
-				route.IsPrimary = hsdb.isUniquePrefix(route)
+				route.IsPrimary = isUniquePrefix(tx, route)
 			}
 
-			err = hsdb.db.Save(&route).Error
+			err = tx.Save(&route).Error
 			if err != nil {
-				return fmt.Errorf("failed to enable route: %w", err)
+				return nil, fmt.Errorf("failed to enable route: %w", err)
 			}
 		} else {
-			return fmt.Errorf("failed to find route: %w", err)
+			return nil, fmt.Errorf("failed to find route: %w", err)
 		}
 	}
 
 	// Ensure the node has the latest routes when notifying the other
 	// nodes
-	nRoutes, err := hsdb.getNodeRoutes(node)
+	nRoutes, err := GetNodeRoutes(tx, node)
 	if err != nil {
-		return fmt.Errorf("failed to read back routes: %w", err)
+		return nil, fmt.Errorf("failed to read back routes: %w", err)
 	}
 
 	node.Routes = nRoutes
@@ -729,17 +583,11 @@ func (hsdb *HSDatabase) enableRoutes(node *types.Node, routeStrs ...string) erro
 		Strs("routes", routeStrs).
 		Msg("enabling routes")
 
-	stateUpdate := types.StateUpdate{
+	return &types.StateUpdate{
 		Type:        types.StatePeerChanged,
-		ChangeNodes: types.Nodes{node},
-		Message:     "called from db.enableRoutes",
-	}
-	if stateUpdate.Valid() {
-		hsdb.notifier.NotifyWithIgnore(
-			stateUpdate, node.MachineKey.String())
-	}
-
-	return nil
+		ChangeNodes: []types.NodeID{node.ID},
+		Message:     "created in db.enableRoutes",
+	}, nil
 }
 
 func generateGivenName(suppliedName string, randomSuffix bool) (string, error) {
@@ -772,16 +620,23 @@ func (hsdb *HSDatabase) GenerateGivenName(
 	mkey key.MachinePublic,
 	suppliedName string,
 ) (string, error) {
-	hsdb.mu.RLock()
-	defer hsdb.mu.RUnlock()
+	return Read(hsdb.DB, func(rx *gorm.DB) (string, error) {
+		return GenerateGivenName(rx, mkey, suppliedName)
+	})
+}
 
+func GenerateGivenName(
+	tx *gorm.DB,
+	mkey key.MachinePublic,
+	suppliedName string,
+) (string, error) {
 	givenName, err := generateGivenName(suppliedName, false)
 	if err != nil {
 		return "", err
 	}
 
 	// Tailscale rules (may differ) https://tailscale.com/kb/1098/machine-names/
-	nodes, err := hsdb.listNodesByGivenName(givenName)
+	nodes, err := listNodesByGivenName(tx, givenName)
 	if err != nil {
 		return "", err
 	}
@@ -805,132 +660,80 @@ func (hsdb *HSDatabase) GenerateGivenName(
 	return givenName, nil
 }
 
-func (hsdb *HSDatabase) ExpireEphemeralNodes(inactivityThreshhold time.Duration) {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
-	users, err := hsdb.listUsers()
+func DeleteExpiredEphemeralNodes(tx *gorm.DB,
+	inactivityThreshhold time.Duration,
+) ([]types.NodeID, []types.NodeID) {
+	users, err := ListUsers(tx)
 	if err != nil {
-		log.Error().Err(err).Msg("Error listing users")
-
-		return
+		return nil, nil
 	}
 
+	var expired []types.NodeID
+	var changedNodes []types.NodeID
 	for _, user := range users {
-		nodes, err := hsdb.listNodesByUser(user.Name)
+		nodes, err := ListNodesByUser(tx, user.Name)
 		if err != nil {
-			log.Error().
-				Err(err).
-				Str("user", user.Name).
-				Msg("Error listing nodes in user")
-
-			return
+			return nil, nil
 		}
 
-		expired := make([]tailcfg.NodeID, 0)
 		for idx, node := range nodes {
 			if node.IsEphemeral() && node.LastSeen != nil &&
 				time.Now().
 					After(node.LastSeen.Add(inactivityThreshhold)) {
-				expired = append(expired, tailcfg.NodeID(node.ID))
+				expired = append(expired, node.ID)
 
 				log.Info().
 					Str("node", node.Hostname).
 					Msg("Ephemeral client removed from database")
 
-				err = hsdb.deleteNode(nodes[idx])
+					// empty isConnected map as ephemeral nodes are not routes
+				changed, err := DeleteNode(tx, nodes[idx], nil)
 				if err != nil {
 					log.Error().
 						Err(err).
 						Str("node", node.Hostname).
 						Msg("🤮 Cannot delete ephemeral node from the database")
 				}
+
+				changedNodes = append(changedNodes, changed...)
 			}
 		}
 
-		if len(expired) > 0 {
-			hsdb.notifier.NotifyAll(types.StateUpdate{
-				Type:    types.StatePeerRemoved,
-				Removed: expired,
-			})
-		}
+		// TODO(kradalby): needs to be moved out of transaction
 	}
+
+	return expired, changedNodes
 }
 
-func (hsdb *HSDatabase) ExpireExpiredNodes(lastCheck time.Time) time.Time {
-	hsdb.mu.Lock()
-	defer hsdb.mu.Unlock()
-
+func ExpireExpiredNodes(tx *gorm.DB,
+	lastCheck time.Time,
+) (time.Time, types.StateUpdate, bool) {
 	// use the time of the start of the function to ensure we
 	// dont miss some nodes by returning it _after_ we have
 	// checked everything.
 	started := time.Now()
 
-	expiredNodes := make([]*types.Node, 0)
+	expired := make([]*tailcfg.PeerChange, 0)
 
-	nodes, err := hsdb.listNodes()
+	nodes, err := ListNodes(tx)
 	if err != nil {
-		log.Error().
-			Err(err).
-			Msg("Error listing nodes to find expired nodes")
-
-		return time.Unix(0, 0)
+		return time.Unix(0, 0), types.StateUpdate{}, false
 	}
-	for index, node := range nodes {
-		if node.IsExpired() &&
-			// TODO(kradalby): Replace this, it is very spammy
-			// It will notify about all nodes that has been expired.
-			// It should only notify about expired nodes since _last check_.
-			node.Expiry.After(lastCheck) {
-			expiredNodes = append(expiredNodes, &nodes[index])
-
-			// Do not use setNodeExpiry as that has a notifier hook, which
-			// can cause a deadlock, we are updating all changed nodes later
-			// and there is no point in notifiying twice.
-			if err := hsdb.db.Model(nodes[index]).Updates(types.Node{
-				Expiry: &started,
-			}).Error; err != nil {
-				log.Error().
-					Err(err).
-					Str("node", node.Hostname).
-					Str("name", node.GivenName).
-					Msg("🤮 Cannot expire node")
-			} else {
-				log.Info().
-					Str("node", node.Hostname).
-					Str("name", node.GivenName).
-					Msg("Node successfully expired")
-			}
+	for _, node := range nodes {
+		if node.IsExpired() && node.Expiry.After(lastCheck) {
+			expired = append(expired, &tailcfg.PeerChange{
+				NodeID:    tailcfg.NodeID(node.ID),
+				KeyExpiry: node.Expiry,
+			})
 		}
 	}
 
-	expired := make([]*tailcfg.PeerChange, len(expiredNodes))
-	for idx, node := range expiredNodes {
-		expired[idx] = &tailcfg.PeerChange{
-			NodeID:    tailcfg.NodeID(node.ID),
-			KeyExpiry: &started,
-		}
+	if len(expired) > 0 {
+		return started, types.StateUpdate{
+			Type:          types.StatePeerChangedPatch,
+			ChangePatches: expired,
+		}, true
 	}
 
-	// Inform the peers of a node with a lightweight update.
-	stateUpdate := types.StateUpdate{
-		Type:          types.StatePeerChangedPatch,
-		ChangePatches: expired,
-	}
-	if stateUpdate.Valid() {
-		hsdb.notifier.NotifyAll(stateUpdate)
-	}
-
-	// Inform the node itself that it has expired.
-	for _, node := range expiredNodes {
-		stateSelfUpdate := types.StateUpdate{
-			Type:        types.StateSelfUpdate,
-			ChangeNodes: types.Nodes{node},
-		}
-		if stateSelfUpdate.Valid() {
-			hsdb.notifier.NotifyByMachineKey(stateSelfUpdate, node.MachineKey)
-		}
-	}
-
-	return started
+	return started, types.StateUpdate{}, false
 }

@@ -1,13 +1,22 @@
 package types
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
+	"time"
 
 	"tailscale.com/tailcfg"
+	"tailscale.com/util/ctxkey"
+)
+
+const (
+	SelfUpdateIdentifier = "self-update"
+	DatabasePostgres     = "postgres"
+	DatabaseSqlite       = "sqlite3"
 )
 
 var ErrCannotParsePrefix = errors.New("cannot parse prefix")
@@ -82,6 +91,25 @@ func (i StringList) Value() (driver.Value, error) {
 
 type StateUpdateType int
 
+func (su StateUpdateType) String() string {
+	switch su {
+	case StateFullUpdate:
+		return "StateFullUpdate"
+	case StatePeerChanged:
+		return "StatePeerChanged"
+	case StatePeerChangedPatch:
+		return "StatePeerChangedPatch"
+	case StatePeerRemoved:
+		return "StatePeerRemoved"
+	case StateSelfUpdate:
+		return "StateSelfUpdate"
+	case StateDERPUpdated:
+		return "StateDERPUpdated"
+	}
+
+	return "unknown state update type"
+}
+
 const (
 	StateFullUpdate StateUpdateType = iota
 	// StatePeerChanged is used for updates that needs
@@ -110,7 +138,7 @@ type StateUpdate struct {
 	// ChangeNodes must be set when Type is StatePeerAdded
 	// and StatePeerChanged and contains the full node
 	// object for added nodes.
-	ChangeNodes Nodes
+	ChangeNodes []NodeID
 
 	// ChangePatches must be set when Type is StatePeerChangedPatch
 	// and contains a populated PeerChange object.
@@ -119,7 +147,7 @@ type StateUpdate struct {
 	// Removed must be set when Type is StatePeerRemoved and
 	// contain a list of the nodes that has been removed from
 	// the network.
-	Removed []tailcfg.NodeID
+	Removed []NodeID
 
 	// DERPMap must be set when Type is StateDERPUpdated and
 	// contain the new DERP Map.
@@ -130,33 +158,40 @@ type StateUpdate struct {
 	Message string
 }
 
-// Valid reports if a StateUpdate is correctly filled and
-// panics if the mandatory fields for a type is not
-// filled.
-// Reports true if valid.
-func (su *StateUpdate) Valid() bool {
+// Empty reports if there are any updates in the StateUpdate.
+func (su *StateUpdate) Empty() bool {
 	switch su.Type {
 	case StatePeerChanged:
-		if su.ChangeNodes == nil {
-			panic("Mandatory field ChangeNodes is not set on StatePeerChanged update")
-		}
+		return len(su.ChangeNodes) == 0
 	case StatePeerChangedPatch:
-		if su.ChangePatches == nil {
-			panic("Mandatory field ChangePatches is not set on StatePeerChangedPatch update")
-		}
+		return len(su.ChangePatches) == 0
 	case StatePeerRemoved:
-		if su.Removed == nil {
-			panic("Mandatory field Removed is not set on StatePeerRemove update")
-		}
-	case StateSelfUpdate:
-		if su.ChangeNodes == nil || len(su.ChangeNodes) != 1 {
-			panic("Mandatory field ChangeNodes is not set for StateSelfUpdate or has more than one node")
-		}
-	case StateDERPUpdated:
-		if su.DERPMap == nil {
-			panic("Mandatory field DERPMap is not set on StateDERPUpdated update")
-		}
+		return len(su.Removed) == 0
 	}
 
-	return true
+	return false
+}
+
+func StateUpdateExpire(nodeID NodeID, expiry time.Time) StateUpdate {
+	return StateUpdate{
+		Type: StatePeerChangedPatch,
+		ChangePatches: []*tailcfg.PeerChange{
+			{
+				NodeID:    nodeID.NodeID(),
+				KeyExpiry: &expiry,
+			},
+		},
+	}
+}
+
+var (
+	NotifyOriginKey   = ctxkey.New("notify.origin", "")
+	NotifyHostnameKey = ctxkey.New("notify.hostname", "")
+)
+
+func NotifyCtx(ctx context.Context, origin, hostname string) context.Context {
+	ctx2, _ := context.WithTimeout(ctx, 3*time.Second)
+	ctx2 = NotifyOriginKey.WithValue(ctx2, origin)
+	ctx2 = NotifyHostnameKey.WithValue(ctx2, hostname)
+	return ctx2
 }

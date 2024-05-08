@@ -3,18 +3,22 @@ package hscontrol
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"sort"
 	"strings"
 	"time"
 
-	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
-	"github.com/juanfont/headscale/hscontrol/types"
-	"github.com/juanfont/headscale/hscontrol/util"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"gorm.io/gorm"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+
+	v1 "github.com/juanfont/headscale/gen/go/headscale/v1"
+	"github.com/juanfont/headscale/hscontrol/db"
+	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util"
 )
 
 type headscaleV1APIServer struct { // v1.HeadscaleServiceServer
@@ -95,6 +99,10 @@ func (api headscaleV1APIServer) ListUsers(
 		response[index] = user.Proto()
 	}
 
+	sort.Slice(response, func(i, j int) bool {
+		return response[i].Id < response[j].Id
+	})
+
 	log.Trace().Caller().Interface("users", response).Msg("")
 
 	return &v1.ListUsersResponse{Users: response}, nil
@@ -136,12 +144,14 @@ func (api headscaleV1APIServer) ExpirePreAuthKey(
 	ctx context.Context,
 	request *v1.ExpirePreAuthKeyRequest,
 ) (*v1.ExpirePreAuthKeyResponse, error) {
-	preAuthKey, err := api.h.db.GetPreAuthKey(request.GetUser(), request.Key)
-	if err != nil {
-		return nil, err
-	}
+	err := api.h.db.Write(func(tx *gorm.DB) error {
+		preAuthKey, err := db.GetPreAuthKey(tx, request.GetUser(), request.Key)
+		if err != nil {
+			return err
+		}
 
-	err = api.h.db.ExpirePreAuthKey(preAuthKey)
+		return db.ExpirePreAuthKey(tx, preAuthKey)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -163,6 +173,10 @@ func (api headscaleV1APIServer) ListPreAuthKeys(
 		response[index] = key.Proto()
 	}
 
+	sort.Slice(response, func(i, j int) bool {
+		return response[i].Id < response[j].Id
+	})
+
 	return &v1.ListPreAuthKeysResponse{PreAuthKeys: response}, nil
 }
 
@@ -181,13 +195,22 @@ func (api headscaleV1APIServer) RegisterNode(
 		return nil, err
 	}
 
-	node, err := api.h.db.RegisterNodeFromAuthCallback(
-		api.h.registrationCache,
-		mkey,
-		request.GetUser(),
-		nil,
-		util.RegisterMethodCLI,
-	)
+	ipv4, ipv6, err := api.h.ipAlloc.Next()
+	if err != nil {
+		return nil, err
+	}
+
+	node, err := db.Write(api.h.db.DB, func(tx *gorm.DB) (*types.Node, error) {
+		return db.RegisterNodeFromAuthCallback(
+			tx,
+			api.h.registrationCache,
+			mkey,
+			request.GetUser(),
+			nil,
+			util.RegisterMethodCLI,
+			ipv4, ipv6,
+		)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +222,7 @@ func (api headscaleV1APIServer) GetNode(
 	ctx context.Context,
 	request *v1.GetNodeRequest,
 ) (*v1.GetNodeResponse, error) {
-	node, err := api.h.db.GetNodeByID(request.GetNodeId())
+	node, err := api.h.db.GetNodeByID(types.NodeID(request.GetNodeId()))
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +231,7 @@ func (api headscaleV1APIServer) GetNode(
 
 	// Populate the online field based on
 	// currently connected nodes.
-	resp.Online = api.h.nodeNotifier.IsConnected(node.MachineKey)
+	resp.Online = api.h.nodeNotifier.IsConnected(node.ID)
 
 	return &v1.GetNodeResponse{Node: resp}, nil
 }
@@ -217,26 +240,33 @@ func (api headscaleV1APIServer) SetTags(
 	ctx context.Context,
 	request *v1.SetTagsRequest,
 ) (*v1.SetTagsResponse, error) {
-	node, err := api.h.db.GetNodeByID(request.GetNodeId())
-	if err != nil {
-		return nil, err
-	}
-
 	for _, tag := range request.GetTags() {
 		err := validateTag(tag)
 		if err != nil {
-			return &v1.SetTagsResponse{
-				Node: nil,
-			}, status.Error(codes.InvalidArgument, err.Error())
+			return nil, err
 		}
 	}
 
-	err = api.h.db.SetTags(node, request.GetTags())
+	node, err := db.Write(api.h.db.DB, func(tx *gorm.DB) (*types.Node, error) {
+		err := db.SetTags(tx, types.NodeID(request.GetNodeId()), request.GetTags())
+		if err != nil {
+			return nil, err
+		}
+
+		return db.GetNodeByID(tx, types.NodeID(request.GetNodeId()))
+	})
 	if err != nil {
 		return &v1.SetTagsResponse{
 			Node: nil,
-		}, status.Error(codes.Internal, err.Error())
+		}, status.Error(codes.InvalidArgument, err.Error())
 	}
+
+	ctx = types.NotifyCtx(ctx, "cli-settags", node.Hostname)
+	api.h.nodeNotifier.NotifyWithIgnore(ctx, types.StateUpdate{
+		Type:        types.StatePeerChanged,
+		ChangeNodes: []types.NodeID{node.ID},
+		Message:     "called from api.SetTags",
+	}, node.ID)
 
 	log.Trace().
 		Str("node", node.Hostname).
@@ -248,13 +278,13 @@ func (api headscaleV1APIServer) SetTags(
 
 func validateTag(tag string) error {
 	if strings.Index(tag, "tag:") != 0 {
-		return fmt.Errorf("tag must start with the string 'tag:'")
+		return errors.New("tag must start with the string 'tag:'")
 	}
 	if strings.ToLower(tag) != tag {
-		return fmt.Errorf("tag should be lowercase")
+		return errors.New("tag should be lowercase")
 	}
 	if len(strings.Fields(tag)) > 1 {
-		return fmt.Errorf("tag should not contains space")
+		return errors.New("tag should not contains space")
 	}
 	return nil
 }
@@ -263,16 +293,30 @@ func (api headscaleV1APIServer) DeleteNode(
 	ctx context.Context,
 	request *v1.DeleteNodeRequest,
 ) (*v1.DeleteNodeResponse, error) {
-	node, err := api.h.db.GetNodeByID(request.GetNodeId())
+	node, err := api.h.db.GetNodeByID(types.NodeID(request.GetNodeId()))
 	if err != nil {
 		return nil, err
 	}
 
-	err = api.h.db.DeleteNode(
+	changedNodes, err := api.h.db.DeleteNode(
 		node,
+		api.h.nodeNotifier.LikelyConnectedMap(),
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	ctx = types.NotifyCtx(ctx, "cli-deletenode", node.Hostname)
+	api.h.nodeNotifier.NotifyAll(ctx, types.StateUpdate{
+		Type:    types.StatePeerRemoved,
+		Removed: []types.NodeID{node.ID},
+	})
+
+	if changedNodes != nil {
+		api.h.nodeNotifier.NotifyAll(ctx, types.StateUpdate{
+			Type:        types.StatePeerChanged,
+			ChangeNodes: changedNodes,
+		})
 	}
 
 	return &v1.DeleteNodeResponse{}, nil
@@ -282,17 +326,32 @@ func (api headscaleV1APIServer) ExpireNode(
 	ctx context.Context,
 	request *v1.ExpireNodeRequest,
 ) (*v1.ExpireNodeResponse, error) {
-	node, err := api.h.db.GetNodeByID(request.GetNodeId())
+	now := time.Now()
+
+	node, err := db.Write(api.h.db.DB, func(tx *gorm.DB) (*types.Node, error) {
+		db.NodeSetExpiry(
+			tx,
+			types.NodeID(request.GetNodeId()),
+			now,
+		)
+
+		return db.GetNodeByID(tx, types.NodeID(request.GetNodeId()))
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	now := time.Now()
+	ctx = types.NotifyCtx(ctx, "cli-expirenode-self", node.Hostname)
+	api.h.nodeNotifier.NotifyByNodeID(
+		ctx,
+		types.StateUpdate{
+			Type:        types.StateSelfUpdate,
+			ChangeNodes: []types.NodeID{node.ID},
+		},
+		node.ID)
 
-	api.h.db.NodeSetExpiry(
-		node,
-		now,
-	)
+	ctx = types.NotifyCtx(ctx, "cli-expirenode-peers", node.Hostname)
+	api.h.nodeNotifier.NotifyWithIgnore(ctx, types.StateUpdateExpire(node.ID, now), node.ID)
 
 	log.Trace().
 		Str("node", node.Hostname).
@@ -306,18 +365,28 @@ func (api headscaleV1APIServer) RenameNode(
 	ctx context.Context,
 	request *v1.RenameNodeRequest,
 ) (*v1.RenameNodeResponse, error) {
-	node, err := api.h.db.GetNodeByID(request.GetNodeId())
+	node, err := db.Write(api.h.db.DB, func(tx *gorm.DB) (*types.Node, error) {
+		err := db.RenameNode(
+			tx,
+			request.GetNodeId(),
+			request.GetNewName(),
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		return db.GetNodeByID(tx, types.NodeID(request.GetNodeId()))
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	err = api.h.db.RenameNode(
-		node,
-		request.GetNewName(),
-	)
-	if err != nil {
-		return nil, err
-	}
+	ctx = types.NotifyCtx(ctx, "cli-renamenode", node.Hostname)
+	api.h.nodeNotifier.NotifyWithIgnore(ctx, types.StateUpdate{
+		Type:        types.StatePeerChanged,
+		ChangeNodes: []types.NodeID{node.ID},
+		Message:     "called from api.RenameNode",
+	}, node.ID)
 
 	log.Trace().
 		Str("node", node.Hostname).
@@ -331,8 +400,11 @@ func (api headscaleV1APIServer) ListNodes(
 	ctx context.Context,
 	request *v1.ListNodesRequest,
 ) (*v1.ListNodesResponse, error) {
+	isLikelyConnected := api.h.nodeNotifier.LikelyConnectedMap()
 	if request.GetUser() != "" {
-		nodes, err := api.h.db.ListNodesByUser(request.GetUser())
+		nodes, err := db.Read(api.h.db.DB, func(rx *gorm.DB) (types.Nodes, error) {
+			return db.ListNodesByUser(rx, request.GetUser())
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -343,7 +415,9 @@ func (api headscaleV1APIServer) ListNodes(
 
 			// Populate the online field based on
 			// currently connected nodes.
-			resp.Online = api.h.nodeNotifier.IsConnected(node.MachineKey)
+			if val, ok := isLikelyConnected.Load(node.ID); ok && val {
+				resp.Online = true
+			}
 
 			response[index] = resp
 		}
@@ -356,16 +430,22 @@ func (api headscaleV1APIServer) ListNodes(
 		return nil, err
 	}
 
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].ID < nodes[j].ID
+	})
+
 	response := make([]*v1.Node, len(nodes))
 	for index, node := range nodes {
 		resp := node.Proto()
 
 		// Populate the online field based on
 		// currently connected nodes.
-		resp.Online = api.h.nodeNotifier.IsConnected(node.MachineKey)
+		if val, ok := isLikelyConnected.Load(node.ID); ok && val {
+			resp.Online = true
+		}
 
 		validTags, invalidTags := api.h.ACLPolicy.TagsOfNode(
-			&node,
+			node,
 		)
 		resp.InvalidTags = invalidTags
 		resp.ValidTags = validTags
@@ -379,7 +459,7 @@ func (api headscaleV1APIServer) MoveNode(
 	ctx context.Context,
 	request *v1.MoveNodeRequest,
 ) (*v1.MoveNodeResponse, error) {
-	node, err := api.h.db.GetNodeByID(request.GetNodeId())
+	node, err := api.h.db.GetNodeByID(types.NodeID(request.GetNodeId()))
 	if err != nil {
 		return nil, err
 	}
@@ -392,11 +472,31 @@ func (api headscaleV1APIServer) MoveNode(
 	return &v1.MoveNodeResponse{Node: node.Proto()}, nil
 }
 
+func (api headscaleV1APIServer) BackfillNodeIPs(
+	ctx context.Context,
+	request *v1.BackfillNodeIPsRequest,
+) (*v1.BackfillNodeIPsResponse, error) {
+	log.Trace().Msg("Backfill called")
+
+	if !request.Confirmed {
+		return nil, errors.New("not confirmed, aborting")
+	}
+
+	changes, err := api.h.db.BackfillNodeIPs(api.h.ipAlloc)
+	if err != nil {
+		return nil, err
+	}
+
+	return &v1.BackfillNodeIPsResponse{Changes: changes}, nil
+}
+
 func (api headscaleV1APIServer) GetRoutes(
 	ctx context.Context,
 	request *v1.GetRoutesRequest,
 ) (*v1.GetRoutesResponse, error) {
-	routes, err := api.h.db.GetRoutes()
+	routes, err := db.Read(api.h.db.DB, func(rx *gorm.DB) (types.Routes, error) {
+		return db.GetRoutes(rx)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -410,9 +510,17 @@ func (api headscaleV1APIServer) EnableRoute(
 	ctx context.Context,
 	request *v1.EnableRouteRequest,
 ) (*v1.EnableRouteResponse, error) {
-	err := api.h.db.EnableRoute(request.GetRouteId())
+	update, err := db.Write(api.h.db.DB, func(tx *gorm.DB) (*types.StateUpdate, error) {
+		return db.EnableRoute(tx, request.GetRouteId())
+	})
 	if err != nil {
 		return nil, err
+	}
+
+	if update != nil {
+		ctx := types.NotifyCtx(ctx, "cli-enableroute", "unknown")
+		api.h.nodeNotifier.NotifyAll(
+			ctx, *update)
 	}
 
 	return &v1.EnableRouteResponse{}, nil
@@ -422,9 +530,19 @@ func (api headscaleV1APIServer) DisableRoute(
 	ctx context.Context,
 	request *v1.DisableRouteRequest,
 ) (*v1.DisableRouteResponse, error) {
-	err := api.h.db.DisableRoute(request.GetRouteId())
+	update, err := db.Write(api.h.db.DB, func(tx *gorm.DB) ([]types.NodeID, error) {
+		return db.DisableRoute(tx, request.GetRouteId(), api.h.nodeNotifier.LikelyConnectedMap())
+	})
 	if err != nil {
 		return nil, err
+	}
+
+	if update != nil {
+		ctx := types.NotifyCtx(ctx, "cli-disableroute", "unknown")
+		api.h.nodeNotifier.NotifyAll(ctx, types.StateUpdate{
+			Type:        types.StatePeerChanged,
+			ChangeNodes: update,
+		})
 	}
 
 	return &v1.DisableRouteResponse{}, nil
@@ -434,7 +552,7 @@ func (api headscaleV1APIServer) GetNodeRoutes(
 	ctx context.Context,
 	request *v1.GetNodeRoutesRequest,
 ) (*v1.GetNodeRoutesResponse, error) {
-	node, err := api.h.db.GetNodeByID(request.GetNodeId())
+	node, err := api.h.db.GetNodeByID(types.NodeID(request.GetNodeId()))
 	if err != nil {
 		return nil, err
 	}
@@ -453,9 +571,20 @@ func (api headscaleV1APIServer) DeleteRoute(
 	ctx context.Context,
 	request *v1.DeleteRouteRequest,
 ) (*v1.DeleteRouteResponse, error) {
-	err := api.h.db.DeleteRoute(request.GetRouteId())
+	isConnected := api.h.nodeNotifier.LikelyConnectedMap()
+	update, err := db.Write(api.h.db.DB, func(tx *gorm.DB) ([]types.NodeID, error) {
+		return db.DeleteRoute(tx, request.GetRouteId(), isConnected)
+	})
 	if err != nil {
 		return nil, err
+	}
+
+	if update != nil {
+		ctx := types.NotifyCtx(ctx, "cli-deleteroute", "unknown")
+		api.h.nodeNotifier.NotifyAll(ctx, types.StateUpdate{
+			Type:        types.StatePeerChanged,
+			ChangeNodes: update,
+		})
 	}
 
 	return &v1.DeleteRouteResponse{}, nil
@@ -514,7 +643,32 @@ func (api headscaleV1APIServer) ListApiKeys(
 		response[index] = key.Proto()
 	}
 
+	sort.Slice(response, func(i, j int) bool {
+		return response[i].Id < response[j].Id
+	})
+
 	return &v1.ListApiKeysResponse{ApiKeys: response}, nil
+}
+
+func (api headscaleV1APIServer) DeleteApiKey(
+	ctx context.Context,
+	request *v1.DeleteApiKeyRequest,
+) (*v1.DeleteApiKeyResponse, error) {
+	var (
+		apiKey *types.APIKey
+		err    error
+	)
+
+	apiKey, err = api.h.db.GetAPIKey(request.Prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := api.h.db.DestroyAPIKey(*apiKey); err != nil {
+		return nil, err
+	}
+
+	return &v1.DeleteApiKeyResponse{}, nil
 }
 
 // The following service calls are for testing and debugging
